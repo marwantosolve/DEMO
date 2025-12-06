@@ -1,4 +1,0 @@
-!gdown --id 1xzfUfAvTDThXD9FFKRVc0X2OZukmmsSZ
-!gdown --id 1U1PZunzd3OTluPs_2dAhLpiF65fTQDbT
-!unzip mas_eval.zip
-!unzip mast_dataset.zip

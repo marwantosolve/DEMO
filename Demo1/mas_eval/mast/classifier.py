@@ -5,6 +5,7 @@ Uses LLMs (Gemini or fine-tuned models) to classify MAS traces
 into MAST failure modes.
 """
 
+import os
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from enum import Enum
@@ -16,9 +17,10 @@ from mas_eval.mast.taxonomy import MASTTaxonomy, FailureCategory
 
 class ClassifierMode(Enum):
     """Classification strategy."""
-    ZERO_SHOT = "zero_shot"
-    FEW_SHOT = "few_shot"
-    FINE_TUNED = "fine_tuned"
+    ZERO_SHOT = "zero_shot"      # Base model + Instructions
+    FEW_SHOT = "few_shot"        # Base model + Generic examples
+    FEW_SHOT_ICL = "few_shot_icl" # Base model + Real MAD dataset examples
+    FINE_TUNED = "fine_tuned"    # Actual fine-tuned model (minimal prompting)
 
 
 @dataclass
@@ -81,29 +83,35 @@ class MASTClassifier(BaseClassifier):
         
         Args:
             model: Model name (Gemini model or path to fine-tuned model)
-            mode: Classification strategy (zero_shot, few_shot, fine_tuned)
+            mode: Classification strategy
             confidence_threshold: Minimum confidence to report failure
-            api_key: Optional API key (uses GOOGLE_API_KEY env var if not provided)
-            dataset_path: Path to MAST dataset for in-context learning examples
+            api_key: Gemini API key
+            dataset_path: Path to MAD dataset (for FEW_SHOT_ICL mode)
         """
         super().__init__(name="MASTClassifier", model_name=model)
         
+        self.model_name = model
         self.mode = mode
         self.confidence_threshold = confidence_threshold
-        self.api_key = api_key
+        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        self.dataset_path = dataset_path
         self.taxonomy = MASTTaxonomy()
         self._client = None
         
-        # Initialize few-shot loader for in-context learning
-        from mas_eval.mast.mast_fewshot import MASTFewShotLoader
-        self._fewshot_loader = MASTFewShotLoader(dataset_path)
+        # Load few-shot loader if needed
+        self._fewshot_loader = None
+        if self.mode == ClassifierMode.FEW_SHOT_ICL:
+            from mas_eval.mast.mast_fewshot import MASTFewShotLoader
+            self._fewshot_loader = MASTFewShotLoader(dataset_path)
+            if not self._fewshot_loader.load():
+                print("Warning: Failed to load MAD dataset. Fallback to FEW_SHOT.")
+                self.mode = ClassifierMode.FEW_SHOT
     
     def _initialize_client(self):
         """Lazy initialize the Gemini client."""
         if self._client is None:
             try:
                 import google.generativeai as genai
-                import os
                 
                 api_key = self.api_key or os.environ.get("GOOGLE_API_KEY")
                 if not api_key:
@@ -213,7 +221,6 @@ class MASTClassifier(BaseClassifier):
         # Tool call pairings
         lines.append("\n## Tool Usage Pattern")
         tool_calls = [s for s in spans if s.step_type.value == 'tool_call']
-        tool_results = [s for s in spans if s.step_type.value == 'tool_result']
         
         if tool_calls:
             lines.append(f"  Total tool calls: {len(tool_calls)}")
@@ -236,17 +243,18 @@ class MASTClassifier(BaseClassifier):
         """Build the classification prompt."""
         taxonomy_context = self.taxonomy.to_prompt_context()
         
-        if self.mode == ClassifierMode.ZERO_SHOT:
-            return self._zero_shot_prompt(trace_text, taxonomy_context)
+        if self.mode == ClassifierMode.FEW_SHOT_ICL:
+            return self._few_shot_icl_prompt(trace_text, taxonomy_context)
+        elif self.mode == ClassifierMode.FINE_TUNED:
+            return self._fine_tuned_prompt(trace_text)
         elif self.mode == ClassifierMode.FEW_SHOT:
             return self._few_shot_prompt(trace_text, taxonomy_context)
-        elif self.mode == ClassifierMode.FINE_TUNED:
-            return self._fine_tuned_prompt(trace_text, taxonomy_context)
         else:
             return self._zero_shot_prompt(trace_text, taxonomy_context)
     
-    def _fine_tuned_prompt(self, trace_text: str, taxonomy: str) -> str:
-        """Build in-context learning prompt with real dataset examples.
+    def _few_shot_icl_prompt(self, trace_text: str, taxonomy: str) -> str:
+        """
+        Build in-context learning prompt with real dataset examples.
         
         Uses the MAD (Multi-Agent Traces) dataset for few-shot learning.
         This provides real-world examples of failure modes for better classification.
@@ -254,10 +262,10 @@ class MASTClassifier(BaseClassifier):
         detailed_taxonomy = self._get_detailed_taxonomy()
         
         # Get real examples from MAD dataset for in-context learning
-        # Use 5 examples for better coverage of failure modes
-        real_examples = self._fewshot_loader.get_few_shot_prompt_section(max_examples=5)
+        real_examples = ""
+        if self._fewshot_loader:
+            real_examples = self._fewshot_loader.get_few_shot_prompt_section(max_examples=5)
         
-        examples_section = ""
         if real_examples:
             examples_section = f"""
 ## REAL EXAMPLES FROM MAD DATASET
@@ -347,6 +355,20 @@ IMPORTANT:
 - Provide specific evidence from the trace for each failure
 - If no failures are detected, return empty failures array
 - Be thorough but avoid false positives"""
+    
+    def _fine_tuned_prompt(self, trace_text: str) -> str:
+        """
+        Build prompt for a real fine-tuned model.
+        
+        Fine-tuned models already know the taxonomy and task, so only
+        minimal instruction is needed to save tokens.
+        """
+        return f"""Analyze the MAS trace for MAST failure modes.
+
+Trace:
+{trace_text}
+
+Output JSON:"""
     
     def _get_detailed_taxonomy(self) -> str:
         """Get detailed taxonomy context for fine-tuned classification."""

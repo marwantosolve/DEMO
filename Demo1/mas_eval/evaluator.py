@@ -13,7 +13,8 @@ from mas_eval.core.types import Span, TraceData, EvaluationResult, FailureMode
 from mas_eval.tracer import TracerModule
 from mas_eval.graph import CRGModule, GraphVisualizer
 from mas_eval.metrics import MetricsModule, GEMMAS_Evaluator, ThoughtRelevanceMetric
-from mas_eval.mast import MASTClassifier, MASTTaxonomy
+from mas_eval.metrics.thought_relevance import ThoughtQualityMetric
+from mas_eval.mast import MASTClassifier, MASTTaxonomy, ClassifierMode
 from mas_eval.suggestions import MASAdvisor
 
 
@@ -45,6 +46,7 @@ class MASEvaluator:
         enable_gemmas: bool = True,
         enable_mast: bool = True,
         mast_model: str = "gemini-2.0-flash",
+        mast_mode: str = "few_shot_icl", # zero_shot, few_shot, few_shot_icl, fine_tuned
         mast_confidence: float = 0.5,
         custom_metrics: Optional[Dict[str, Any]] = None,
         config: Optional[Dict[str, Any]] = None
@@ -58,6 +60,7 @@ class MASEvaluator:
             enable_gemmas: Enable GEMMAS metrics (IDS/UPR)
             enable_mast: Enable MAST failure classification
             mast_model: Model to use for MAST classification
+            mast_mode: Classification mode (zero_shot, few_shot_icl, fine_tuned)
             mast_confidence: Minimum confidence for MAST failures
             custom_metrics: Dictionary of custom metrics to register
             config: Additional configuration options
@@ -86,14 +89,26 @@ class MASEvaluator:
                     self._metrics.register(name, metric)
         
         if enable_mast:
+            # Map string mode to Enum
+            try:
+                mode_enum = ClassifierMode(mast_mode)
+            except ValueError:
+                mode_enum = ClassifierMode.FEW_SHOT_ICL
+                
             self._mast = MASTClassifier(
                 model=mast_model,
+                mode=mode_enum,
                 confidence_threshold=mast_confidence
             )
         
-        # Initialize TRS and Advisor
+        # Initialize TRS, Thought Quality, and Advisor
         self._trs = ThoughtRelevanceMetric()
+        self._thought_quality = ThoughtQualityMetric()
         self._advisor = MASAdvisor()
+        
+        # GOT enhancement settings
+        self._enable_semantic_edges = self.config.get("enable_semantic_edges", True)
+        self._enable_info_flow = self.config.get("enable_info_flow", True)
     
     def evaluate(
         self,
@@ -121,6 +136,27 @@ class MASEvaluator:
         graph_stats = {}
         if self._crg:
             graph = self._crg.build(spans)
+            
+            # === GOT Enhancements ===
+            # Add semantic edges to connect related thoughts
+            if self._enable_semantic_edges:
+                try:
+                    semantic_count = self._crg.add_semantic_edges(
+                        similarity_threshold=0.6,
+                        cross_agent_only=True
+                    )
+                    print(f"[GOT] Added {semantic_count} semantic edges")
+                except Exception as e:
+                    print(f"[GOT] Semantic edges skipped: {e}")
+            
+            # Add information flow edges
+            if self._enable_info_flow:
+                try:
+                    flow_count = self._crg.add_information_flow_edges()
+                    print(f"[GOT] Added {flow_count} information flow edges")
+                except Exception as e:
+                    print(f"[GOT] Info flow edges skipped: {e}")
+            
             graph_stats = self._crg.get_statistics()
             
             if include_visualization and output_dir:
@@ -138,6 +174,18 @@ class MASEvaluator:
         if self._trs:
             trs_result = self._trs.calculate(graph, spans)
             metrics["TRS"] = trs_result.get("overall_score", 0.0)
+        
+        # Calculate comprehensive Thought Quality
+        thought_quality_result = None
+        if self._thought_quality:
+            try:
+                thought_quality_result = self._thought_quality.calculate(graph, spans)
+                metrics["ThoughtQuality"] = thought_quality_result.get("overall_score", 0.0)
+                metrics["Coherence"] = thought_quality_result.get("coherence", 0.0)
+                metrics["Depth"] = thought_quality_result.get("depth", 0.0)
+                metrics["Actionability"] = thought_quality_result.get("actionability", 0.0)
+            except Exception as e:
+                print(f"[GOT] Thought quality calculation failed: {e}")
         
         # MAST classification
         failures = []
@@ -247,17 +295,27 @@ class MASEvaluator:
         score_color = "#4CAF50" if score >= 0.7 else "#FF9800" if score >= 0.4 else "#F44336"
         
         failures_html = ""
-        if result.failures:
-            for f in result.failures:
                 failures_html += f"""
-                <div class="failure">
-                    <strong>[{f.code}] {f.name}</strong><br>
-                    <small>Category: {f.category} | Confidence: {f.confidence:.2%}</small><br>
-                    <p>{f.evidence[:300]}{'...' if len(f.evidence) > 300 else ''}</p>
+                <div class="failure-card" data-category="{f.category}">
+                    <div class="failure-header">
+                        <span class="failure-code">{f.code}</span>
+                        <span class="failure-cat">{f.category}</span>
+                    </div>
+                    <div style="font-size: 18px; font-weight: bold; margin-bottom: 8px;">{f.name}</div>
+                    <div style="margin-bottom: 8px; font-size: 14px;">
+                        Confidence: <span class="{ 'confidence-high' if f.confidence > 0.8 else 'confidence-med' }">{f.confidence:.0%}</span>
+                    </div>
+                    <p style="margin: 0; color: #444;">{f.evidence}</p>
+                    { f'<div class="evidence">Reasoning: ' + f.reasoning + '</div>' if hasattr(f, 'reasoning') and f.reasoning else '' }
                 </div>
                 """
         else:
-            failures_html = "<p style='color: #4CAF50;'>✅ No failures detected</p>"
+            failures_html = """
+            <div style="text-align: center; padding: 40px; background: #f8f9fa; border-radius: 8px;">
+                <h3 style="color: #188038; margin: 0;">✅ No Failures Detected</h3>
+                <p style="color: #666;">The Multi-Agent System performed within expected parameters.</p>
+            </div>
+            """
         
         # Generate suggestions HTML
         suggestions_html = ""
@@ -285,56 +343,119 @@ class MASEvaluator:
                     trs_html += f'<li><strong>{agent}:</strong> <span style="color:{color}">{data["score"]:.2f}</span> ({data["thought_count"]} thoughts)</li>'
                 trs_html += '</ul></div>'
         
+        # Get available failure filters
+        categories = set(f.category for f in result.failures)
+        filter_buttons = "".join([f'<button onclick="filterFailures(\'{cat}\')">{cat}</button>' for cat in categories])
+        filter_buttons = f'<button onclick="filterFailures(\'all\')" class="active">All</button>' + filter_buttons
+        
         return f"""
 <!DOCTYPE html>
 <html>
 <head>
     <title>MAS Evaluation Report</title>
     <style>
-        body {{ font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }}
-        .container {{ max-width: 1000px; margin: auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
-        h1 {{ color: #333; border-bottom: 2px solid #4CAF50; padding-bottom: 10px; }}
-        h2 {{ color: #444; margin-top: 30px; }}
-        .score {{ font-size: 48px; font-weight: bold; color: {score_color}; }}
-        .metric {{ display: inline-block; margin: 10px 20px; padding: 15px; background: #f9f9f9; border-radius: 8px; text-align: center; }}
-        .metric-value {{ font-size: 24px; font-weight: bold; color: #333; }}
-        .metric-label {{ font-size: 12px; color: #666; }}
-        .failure {{ background: #fff3cd; padding: 15px; margin: 10px 0; border-radius: 5px; border-left: 4px solid #ffc107; }}
-        .stats {{ background: #e3f2fd; padding: 15px; border-radius: 5px; margin-top: 20px; }}
-        .suggestions {{ margin-top: 20px; }}
-        .suggestion {{ border-left: 4px solid; padding: 12px; margin: 10px 0; background: #f8f9fa; border-radius: 4px; }}
+        body {{ font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; margin: 0; background: #f8f9fa; color: #333; }}
+        .header {{ background: #1a73e8; color: white; padding: 20px 40px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        .container {{ max-width: 1200px; margin: 40px auto; padding: 0 20px; }}
+        .card {{ background: white; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 25px; margin-bottom: 20px; }}
+        h1 {{ margin: 0; font-size: 24px; }}
+        h2 {{ color: #1a73e8; border-bottom: 2px solid #e8f0fe; padding-bottom: 10px; margin-top: 0; }}
+        
+        .score-box {{ text-align: center; padding: 20px; }}
+        .score-val {{ font-size: 56px; font-weight: bold; color: {score_color}; line-height: 1; }}
+        .score-label {{ font-size: 14px; color: #666; text-transform: uppercase; letter-spacing: 1px; }}
+        
+        .metrics-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; }}
+        .metric-item {{ text-align: center; padding: 15px; background: #f8f9fa; border-radius: 8px; }}
+        .metric-val {{ font-size: 24px; font-weight: bold; color: #333; }}
+        .metric-lbl {{ font-size: 12px; color: #666; margin-top: 5px; }}
+        
+        .filters {{ margin-bottom: 15px; }}
+        .filters button {{ background: #fff; border: 1px solid #ddd; padding: 8px 16px; border-radius: 20px; cursor: pointer; margin-right: 10px; transition: all 0.2s; }}
+        .filters button:hover {{ background: #f1f3f4; }}
+        .filters button.active {{ background: #1a73e8; color: white; border-color: #1a73e8; }}
+        
+        .failure-card {{ border-left: 4px solid #ffc107; background: #fff; padding: 20px; margin-bottom: 15px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }}
+        .failure-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }}
+        .failure-code {{ font-weight: bold; color: #d93025; background: #fce8e6; padding: 4px 8px; border-radius: 4px; }}
+        .failure-cat {{ font-size: 12px; color: #666; background: #f1f3f4; padding: 4px 8px; border-radius: 4px; }}
+        .confidence-high {{ color: #188038; font-weight: bold; }}
+        .confidence-med {{ color: #f9ab00; font-weight: bold; }}
+        .evidence {{ background: #fafafa; padding: 15px; border-radius: 4px; font-style: italic; color: #555; border: 1px solid #eee; margin-top: 10px; }}
+        
+        .suggestion {{ border-left: 4px solid #1a73e8; background: #f8f9fa; padding: 15px; margin-bottom: 10px; border-radius: 4px; }}
+        
+        .footer {{ text-align: center; margin-top: 50px; color: #888; font-size: 12px; padding-bottom: 20px; }}
     </style>
+    <script>
+        function filterFailures(category) {{
+            const cards = document.querySelectorAll('.failure-card');
+            const buttons = document.querySelectorAll('.filters button');
+            
+            buttons.forEach(b => b.classList.remove('active'));
+            event.target.classList.add('active');
+            
+            cards.forEach(card => {{
+                if (category === 'all' || card.dataset.category === category) {{
+                    card.style.display = 'block';
+                }} else {{
+                    card.style.display = 'none';
+                }}
+            }});
+        }}
+    </script>
 </head>
 <body>
+    <div class="header">
+        <div style="max-width: 1200px; margin: auto; display: flex; justify-content: space-between; align-items: center;">
+            <h1>🔍 MAS Evaluation Report</h1>
+            <span style="font-size: 14px; opacity: 0.8;">Trace ID: {result.trace_id}</span>
+        </div>
+    </div>
+
     <div class="container">
-        <h1>🔍 MAS Evaluation Report</h1>
-        <p>Trace ID: {result.trace_id}<br>Generated: {result.timestamp}</p>
-        
-        <h2>Overall Score</h2>
-        <div class="score">{score:.0%}</div>
-        
-        <h2>Metrics</h2>
-        <div class="metric">
-            <div class="metric-value">{result.metrics.get('IDS', 'N/A')}</div>
-            <div class="metric-label">Information Diversity Score</div>
+        <div class="metrics-grid">
+            <div class="card score-box">
+                <div class="score-val">{score:.0%}</div>
+                <div class="score-label">Overall Quality Score</div>
+            </div>
+            
+            <div class="card">
+                <h2>Key Metrics</h2>
+                <div class="metrics-grid">
+                    <div class="metric-item">
+                        <div class="metric-val">{result.metrics.get('IDS', 'N/A')}</div>
+                        <div class="metric-lbl">Diversity (IDS)</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-val">{result.metrics.get('UPR', 'N/A')}</div>
+                        <div class="metric-lbl">Efficiency (UPR)</div>
+                    </div>
+                    {trs_html.replace('<div class="metric">', '').replace('</div>', '') if trs_html else ''}
+                </div>
+            </div>
         </div>
-        <div class="metric">
-            <div class="metric-value">{result.metrics.get('UPR', 'N/A')}</div>
-            <div class="metric-label">Unnecessary Path Ratio</div>
+
+        <div class="card">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h2>MAST Failure Analysis</h2>
+                <div class="filters">
+                    {filter_buttons}
+                </div>
+            </div>
+            
+            <div id="failures-list">
+                {failures_html}
+            </div>
         </div>
-        {trs_html}
         
-        <h2>MAST Failure Analysis</h2>
-        {failures_html}
+        <div class="card">
+             <h2>💡 AI Advisor Suggestions</h2>
+             {suggestions_html}
+        </div>
         
-        <h2>💡 Improvement Suggestions</h2>
-        {suggestions_html}
-        
-        <div class="stats">
-            <h3>Graph Statistics</h3>
-            <p>Nodes: {result.graph_stats.get('num_nodes', 'N/A')} | 
-               Edges: {result.graph_stats.get('num_edges', 'N/A')} | 
-               Agents: {result.graph_stats.get('num_agents', 'N/A')}</p>
+        <div class="footer">
+            Generated by MAS Evaluation Framework • {result.timestamp}
         </div>
     </div>
 </body>
