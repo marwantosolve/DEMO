@@ -295,6 +295,8 @@ class MASEvaluator:
         score_color = "#4CAF50" if score >= 0.7 else "#FF9800" if score >= 0.4 else "#F44336"
         
         failures_html = ""
+        if result.failures:
+            for f in result.failures:
                 failures_html += f"""
                 <div class="failure-card" data-category="{f.category}">
                     <div class="failure-header">
