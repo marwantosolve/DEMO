@@ -34,7 +34,7 @@ class MASEvaluator:
         # Advanced configuration
         evaluator = MASEvaluator(
             enable_mast=True,
-            mast_model="gemini-2.0-flash",
+            mast_model="gemini-2.5-flash",
             custom_metrics={"balance": AgentActivityMetric()}
         )
     """
@@ -45,7 +45,7 @@ class MASEvaluator:
         enable_crg: bool = True,
         enable_gemmas: bool = True,
         enable_mast: bool = True,
-        mast_model: str = "gemini-2.0-flash",
+        mast_model: str = "gemini-2.5-flash",
         mast_mode: str = "few_shot_icl", # zero_shot, few_shot, few_shot_icl, fine_tuned
         mast_confidence: float = 0.5,
         custom_metrics: Optional[Dict[str, Any]] = None,

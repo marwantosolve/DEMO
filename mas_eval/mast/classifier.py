@@ -61,7 +61,7 @@ class MASTClassifier(BaseClassifier):
     Analyzes MAS traces and detects failure modes from the MAST taxonomy.
     
     Usage:
-        classifier = MASTClassifier(model="gemini-2.0-flash")
+        classifier = MASTClassifier(model="gemini-2.5-flash")
         
         # Classify a trace
         result = classifier.classify(spans)
@@ -72,7 +72,7 @@ class MASTClassifier(BaseClassifier):
     
     def __init__(
         self,
-        model: str = "gemini-2.0-flash",
+        model: str = "gemini-2.5-flash",
         mode: ClassifierMode = ClassifierMode.ZERO_SHOT,
         confidence_threshold: float = 0.5,
         api_key: Optional[str] = None,

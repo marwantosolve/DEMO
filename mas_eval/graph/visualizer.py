@@ -276,6 +276,139 @@ class GraphVisualizer:
         net.save_graph(output_path)
         print(f"📊 Interactive graph saved to {output_path}")
     
+    def plot_agent_graph(
+        self,
+        agent_graph: nx.DiGraph,
+        figsize: tuple = (12, 10),
+        output_path: Optional[str] = None,
+        title: str = "Agent Interaction Graph"
+    ) -> None:
+        """
+        Visualize the agent-centric graph with clear, large nodes.
+        
+        Args:
+            agent_graph: NetworkX DiGraph from AgentGraphBuilder (nodes = agents)
+            figsize: Figure size
+            output_path: Optional path to save figure
+            title: Plot title
+        """
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("matplotlib not installed. Run: pip install matplotlib")
+            return
+        
+        if agent_graph.number_of_nodes() == 0:
+            print("⚠️ Empty agent graph, nothing to visualize")
+            return
+        
+        fig, ax = plt.subplots(figsize=figsize)
+        
+        # Use circular layout for agent graphs (cleaner)
+        pos = nx.circular_layout(agent_graph)
+        
+        # Get node sizes based on span count
+        node_sizes = []
+        for node in agent_graph.nodes():
+            data = agent_graph.nodes[node]
+            size = data.get('size', 3000)
+            node_sizes.append(size)
+        
+        # Get node colors
+        node_colors = []
+        for node in agent_graph.nodes():
+            agent_name = str(node)
+            color = self.AGENT_COLORS.get('default')
+            for key, val in self.AGENT_COLORS.items():
+                if key.lower() in agent_name.lower():
+                    color = val
+                    break
+            node_colors.append(color)
+        
+        # Get edge widths based on weight
+        edge_widths = []
+        for u, v, data in agent_graph.edges(data=True):
+            width = data.get('width', 2)
+            edge_widths.append(width)
+        
+        # Draw nodes
+        nx.draw_networkx_nodes(
+            agent_graph, pos,
+            node_color=node_colors,
+            node_size=node_sizes,
+            alpha=0.9,
+            ax=ax
+        )
+        
+        # Draw edges with arrows
+        nx.draw_networkx_edges(
+            agent_graph, pos,
+            edge_color='#555555',
+            width=edge_widths if edge_widths else 2,
+            alpha=0.7,
+            arrows=True,
+            arrowsize=25,
+            connectionstyle="arc3,rad=0.1",
+            ax=ax
+        )
+        
+        # Draw labels (agent names)
+        labels = {node: node for node in agent_graph.nodes()}
+        nx.draw_networkx_labels(
+            agent_graph, pos,
+            labels=labels,
+            font_size=12,
+            font_weight='bold',
+            ax=ax
+        )
+        
+        # Draw edge labels (interaction count)
+        edge_labels = {}
+        for u, v, data in agent_graph.edges(data=True):
+            weight = data.get('weight', 0)
+            if weight > 0:
+                edge_labels[(u, v)] = f"{weight:.0f}"
+        
+        if edge_labels:
+            nx.draw_networkx_edge_labels(
+                agent_graph, pos,
+                edge_labels=edge_labels,
+                font_size=9,
+                font_color='#333333',
+                ax=ax
+            )
+        
+        ax.set_title(title, fontsize=16, fontweight='bold', pad=20)
+        ax.axis('off')
+        
+        # Add legend with agent info
+        import matplotlib.patches as mpatches
+        legend_patches = []
+        for node in agent_graph.nodes():
+            data = agent_graph.nodes[node]
+            spans = data.get('span_count', 0)
+            color = node_colors[list(agent_graph.nodes()).index(node)]
+            legend_patches.append(
+                mpatches.Patch(color=color, label=f"{node}: {spans} spans")
+            )
+        
+        ax.legend(handles=legend_patches, loc='upper left', fontsize=10)
+        
+        plt.tight_layout()
+        
+        if output_path:
+            plt.savefig(output_path, dpi=150, bbox_inches='tight')
+            print(f"📊 Agent graph saved to {output_path}")
+        
+        plt.show()
+        
+        # Print summary
+        print(f"\n🔗 Agent Graph Summary:")
+        print(f"   Agents: {agent_graph.number_of_nodes()}")
+        print(f"   Interactions: {agent_graph.number_of_edges()}")
+        total_weight = sum(d.get('weight', 0) for _, _, d in agent_graph.edges(data=True))
+        print(f"   Total Interaction Events: {total_weight:.0f}")
+    
     def plot_adjacency_matrices(
         self,
         S: any,

@@ -7,7 +7,7 @@ A complete example of a research MAS with 4 specialized agents:
 3. Industry Researcher - Searches industry/commercial sources  
 4. Writer - Synthesizes findings into a report
 
-Uses gemini-2.0-flash model for all agents.
+Uses gemini-2.5-flash model for all agents.
 """
 
 from typing import List, Dict, Any, Optional
@@ -157,7 +157,7 @@ class ResearchMAS:
     
     def __init__(
         self,
-        model: str = "gemini-2.0-flash",
+        model: str = "gemini-2.5-flash",
         api_key: Optional[str] = None
     ):
         """
@@ -298,7 +298,7 @@ class ResearchMAS:
 
 
 def create_research_mas(
-    model: str = "gemini-2.0-flash",
+    model: str = "gemini-2.5-flash",
     api_key: Optional[str] = None
 ) -> ResearchMAS:
     """

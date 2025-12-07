@@ -719,7 +719,7 @@ class ADKAdapter:
         from google.adk.agents import Agent
         from google.adk.runners import InMemoryRunner
         
-        agent = Agent(name="MyAgent", model="gemini-2.0-flash", ...)
+        agent = Agent(name="MyAgent", model="gemini-2.5-flash", ...)
         adapter = ADKAdapter(agent)
         
         # Run with tracing
