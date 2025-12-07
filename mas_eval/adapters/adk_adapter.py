@@ -230,6 +230,9 @@ class ADKTracingCallback:
         self._agent_contexts: Dict[str, str] = {}  # Active context per agent
         self._span_id_set: set = set()  # Fast lookup for span existence
         
+        # GEMMAS: Track iteration count per agent for (Agent_ID, Iteration, Role) nodes
+        self._agent_iterations: Dict[str, int] = {}
+        
         self._trace_id = str(uuid.uuid4())
         self._counter = 0
         self._current_agent: Optional[str] = None
@@ -297,11 +300,24 @@ class ADKTracingCallback:
             return parent_id
         return None
     
+    def _get_agent_iteration(self, agent_name: str) -> int:
+        """Get current iteration counter for an agent (GEMMAS requirement)."""
+        return self._agent_iterations.get(agent_name, 0)
+    
+    def _increment_agent_iteration(self, agent_name: str) -> int:
+        """Increment and return iteration counter for an agent."""
+        if agent_name not in self._agent_iterations:
+            self._agent_iterations[agent_name] = 0
+        self._agent_iterations[agent_name] += 1
+        return self._agent_iterations[agent_name]
+    
     def _register_span(self, agent_name: str, span_id: str) -> None:
-        """Register a span for an agent."""
+        """Register a span for an agent and increment iteration counter."""
         self._last_agent_span[agent_name] = span_id
         if agent_name not in self._agent_span_stack:
             self._agent_span_stack[agent_name] = []
+        # Increment iteration when registering a new span for this agent
+        self._increment_agent_iteration(agent_name)
     
     def _map_event_type(self, event_type: str) -> StepType:
         """Map ADK event types to our StepType."""
@@ -453,6 +469,7 @@ class ADKTracingCallback:
         timestamp = self._extract_event_timestamp(event) if event else datetime.now()
         
         span_id = self._generate_span_id()
+        current_iteration = self._get_agent_iteration(agent_name)
         span = Span(
             span_id=span_id,
             parent_span_id=self._get_parent_span_id(agent_name),
@@ -461,6 +478,7 @@ class ADKTracingCallback:
             step_type=step_type,
             content=self._truncate_with_marker(text),
             start_time=timestamp,
+            iteration=current_iteration,  # GEMMAS: Track iteration
             attributes={
                 "trace_id": self._trace_id,
                 "event_category": "text",
@@ -539,8 +557,9 @@ class ADKTracingCallback:
             self._create_error_span(agent_name, e, "function_response")
     
     def _create_transfer_span(self, agent_name: str, target_agent: str) -> None:
-        """Create a span for agent transfer action."""
+        """Create a span for agent transfer action (tracks Spatial Matrix S)."""
         span_id = self._generate_span_id()
+        current_iteration = self._get_agent_iteration(agent_name)
         span = Span(
             span_id=span_id,
             parent_span_id=self._get_parent_span_id(agent_name),
@@ -549,10 +568,15 @@ class ADKTracingCallback:
             step_type=StepType.ACTION,
             content=f"Transferring to agent: {target_agent}",
             start_time=datetime.now(),
+            iteration=current_iteration,  # GEMMAS: Track iteration
+            from_agent=agent_name,  # GEMMAS: Source for Spatial Matrix
+            to_agent=target_agent,   # GEMMAS: Target for Spatial Matrix
             attributes={
                 "trace_id": self._trace_id,
                 "event_category": "transfer",
-                "target_agent": target_agent
+                "target_agent": target_agent,
+                "from_agent": agent_name,
+                "to_agent": target_agent
             }
         )
         self._add_span(span)

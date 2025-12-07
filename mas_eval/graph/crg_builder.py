@@ -3,14 +3,24 @@ Causal Reasoning Graph (CRG) Module.
 
 Builds and analyzes a Directed Acyclic Graph from agent trace data,
 based on the GEMMAS framework for MAS evaluation.
+
+Enhanced with GEMMAS-aligned adjacency matrices:
+- Spatial Matrix (S): Who talks to whom
+- Temporal Matrix (T): Causal ordering of interactions
 """
 
 from typing import List, Dict, Any, Optional, Tuple
 import networkx as nx
 from datetime import datetime
 
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
 from mas_eval.core.base import BaseModule
-from mas_eval.core.types import Span, Node, Edge, TraceData
+from mas_eval.core.types import Span, Node, Edge, TraceData, StepType
 
 
 class CRGModule(BaseModule):
@@ -18,24 +28,34 @@ class CRGModule(BaseModule):
     Causal Reasoning Graph builder and analyzer.
     
     Converts trace spans into a NetworkX DiGraph where:
-    - Nodes represent agent states (spans)
+    - Nodes represent agent states (spans) with GEMMAS fields (agent_id, iteration, role)
     - Edges represent causal dependencies (parent-child) or temporal order
+    
+    GEMMAS Enhancement:
+    - Spatial Matrix (S): Captures who communicates with whom
+    - Temporal Matrix (T): Captures causal ordering between agents
     
     Usage:
         crg = CRGModule()
         graph = crg.build(spans)
         
+        # Get GEMMAS adjacency matrices
+        S, T, agents = crg.get_adjacency_matrices()
+        
         # Analyze
         stats = crg.get_statistics()
         critical_path = crg.get_critical_path()
-        
-        # Visualize
-        crg.visualize()
     """
     
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__(name="CRGModule", config=config)
         self.graph: nx.DiGraph = nx.DiGraph()
+        self._initialized = True
+        
+        # GEMMAS adjacency matrices
+        self._spatial_matrix: Optional[Any] = None   # S: Who talks to whom
+        self._temporal_matrix: Optional[Any] = None  # T: Causal ordering
+        self._agent_index: Dict[str, int] = {}       # Agent name -> matrix index
         self._initialized = True
     
     def build(self, data: Any) -> nx.DiGraph:
@@ -75,6 +95,9 @@ class CRGModule(BaseModule):
             print(f"[CRG] Graph has {num_edges} edges for {num_nodes} nodes - adding temporal edges")
             self.add_temporal_edges(time_threshold_ms=float('inf'))
         
+        # GEMMAS: Build adjacency matrices after graph construction
+        self._build_adjacency_matrices()
+        
         return self.graph
     
     def _normalize_input(self, data: Any) -> List[Span]:
@@ -91,7 +114,10 @@ class CRGModule(BaseModule):
         raise ValueError(f"Unsupported input type: {type(data)}")
     
     def _add_node(self, span: Span) -> None:
-        """Add a node to the graph from a span."""
+        """Add a GEMMAS-compliant node to the graph from a span."""
+        # Determine role based on step type
+        role = 'response' if span.step_type in [StepType.OUTPUT, StepType.TOOL_RESULT] else 'prompt'
+        
         self.graph.add_node(
             span.span_id,
             agent=span.agent_name,
@@ -99,7 +125,12 @@ class CRGModule(BaseModule):
             content=span.content,
             name=span.name,
             timestamp=span.start_time,
-            duration_ms=span.duration_ms()
+            duration_ms=span.duration_ms(),
+            # GEMMAS fields
+            iteration=getattr(span, 'iteration', 0),
+            role=role,
+            from_agent=getattr(span, 'from_agent', None) or span.attributes.get('from_agent'),
+            to_agent=getattr(span, 'to_agent', None) or span.attributes.get('to_agent')
         )
     
     def _add_edges(self, span: Span) -> None:
@@ -112,6 +143,106 @@ class CRGModule(BaseModule):
                 type="causal",
                 weight=1.0
             )
+        
+        # GEMMAS: Add spatial edge for cross-agent communication
+        from_agent = getattr(span, 'from_agent', None) or span.attributes.get('from_agent')
+        to_agent = getattr(span, 'to_agent', None) or span.attributes.get('to_agent')
+        if from_agent and to_agent and from_agent != to_agent:
+            # Mark this edge as contributing to spatial matrix
+            if span.parent_span_id and self.graph.has_edge(span.parent_span_id, span.span_id):
+                self.graph.edges[span.parent_span_id, span.span_id]['spatial'] = True
+                self.graph.edges[span.parent_span_id, span.span_id]['from_agent'] = from_agent
+                self.graph.edges[span.parent_span_id, span.span_id]['to_agent'] = to_agent
+    
+    def _build_adjacency_matrices(self) -> None:
+        """
+        Build GEMMAS Spatial (S) and Temporal (T) adjacency matrices.
+        
+        Spatial Matrix (S): S[i][j] = count of messages from agent i to agent j
+        Temporal Matrix (T): T[i][j] = count of causal edges where agent i precedes agent j
+        """
+        if not HAS_NUMPY:
+            print("[CRG] Warning: numpy not available, skipping adjacency matrices")
+            return
+        
+        agents = self.get_unique_agents()
+        n = len(agents)
+        if n == 0:
+            return
+        
+        self._agent_index = {a: i for i, a in enumerate(agents)}
+        
+        S = np.zeros((n, n), dtype=np.float32)  # Spatial: who talks to whom
+        T = np.zeros((n, n), dtype=np.float32)  # Temporal: causal ordering
+        
+        # Process all edges to build matrices
+        for u, v, edge_data in self.graph.edges(data=True):
+            u_data = self.graph.nodes[u]
+            v_data = self.graph.nodes[v]
+            
+            u_agent = u_data.get('agent')
+            v_agent = v_data.get('agent')
+            
+            if not u_agent or not v_agent:
+                continue
+            
+            i = self._agent_index.get(u_agent)
+            j = self._agent_index.get(v_agent)
+            
+            if i is None or j is None:
+                continue
+            
+            # Spatial Matrix: Cross-agent communication
+            # Count edges where different agents are involved
+            if u_agent != v_agent:
+                edge_type = edge_data.get('type', 'causal')
+                if edge_type in ['causal', 'information_flow', 'transfer']:
+                    S[i][j] += 1
+                
+                # Also check explicit from/to agent
+                from_a = edge_data.get('from_agent')
+                to_a = edge_data.get('to_agent')
+                if from_a and to_a and from_a != to_a:
+                    fi = self._agent_index.get(from_a)
+                    ti = self._agent_index.get(to_a)
+                    if fi is not None and ti is not None and fi != i:
+                        S[fi][ti] += 1
+            
+            # Temporal Matrix: Based on timestamp ordering
+            u_time = u_data.get('timestamp')
+            v_time = v_data.get('timestamp')
+            
+            if u_time and v_time and u_time < v_time:
+                T[i][j] += 1
+        
+        self._spatial_matrix = S
+        self._temporal_matrix = T
+    
+    def get_adjacency_matrices(self) -> Tuple[Any, Any, List[str]]:
+        """
+        Get GEMMAS Spatial (S) and Temporal (T) adjacency matrices.
+        
+        Returns:
+            Tuple of (S_matrix, T_matrix, agent_names)
+            - S_matrix: Spatial matrix - who communicates with whom
+            - T_matrix: Temporal matrix - causal ordering between agents
+            - agent_names: List of agent names (indices match matrix rows/cols)
+        """
+        if self._spatial_matrix is None:
+            self._build_adjacency_matrices()
+        
+        agents = sorted(self._agent_index.keys(), key=lambda a: self._agent_index[a])
+        return self._spatial_matrix, self._temporal_matrix, agents
+    
+    def get_spatial_matrix(self) -> Tuple[Any, List[str]]:
+        """Get Spatial matrix (S): who communicates with whom."""
+        S, T, agents = self.get_adjacency_matrices()
+        return S, agents
+    
+    def get_temporal_matrix(self) -> Tuple[Any, List[str]]:
+        """Get Temporal matrix (T): causal ordering between agents."""
+        S, T, agents = self.get_adjacency_matrices()
+        return T, agents
     
     def add_temporal_edges(self, time_threshold_ms: float = 100.0) -> None:
         """

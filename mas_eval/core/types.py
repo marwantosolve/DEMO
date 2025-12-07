@@ -23,6 +23,15 @@ class StepType(Enum):
     ERROR = "error"
 
 
+class EdgeType(Enum):
+    """Types of edges in the GEMMAS graph (for adjacency matrices)."""
+    SPATIAL = "spatial"      # Who talks to whom (S matrix)
+    TEMPORAL = "temporal"    # Causal ordering (T matrix)
+    SEMANTIC = "semantic"    # Content similarity
+    CAUSAL = "causal"        # Parent-child relationship
+    INFORMATION_FLOW = "information_flow"  # Content propagation
+
+
 @dataclass
 class Span:
     """
@@ -48,6 +57,10 @@ class Span:
     end_time: Optional[datetime] = None
     parent_span_id: Optional[str] = None
     attributes: Dict[str, Any] = field(default_factory=dict)
+    # GEMMAS fields for iteration and message tracking
+    iteration: int = 0  # Agent's iteration counter
+    from_agent: Optional[str] = None  # Source agent for message passing
+    to_agent: Optional[str] = None    # Target agent for message passing
     
     def duration_ms(self) -> float:
         """Calculate duration in milliseconds."""
@@ -66,7 +79,10 @@ class Span:
             "content": self.content,
             "start_time": self.start_time.isoformat(),
             "end_time": self.end_time.isoformat() if self.end_time else None,
-            "attributes": self.attributes
+            "attributes": self.attributes,
+            "iteration": self.iteration,
+            "from_agent": self.from_agent,
+            "to_agent": self.to_agent
         }
     
     @classmethod
@@ -81,7 +97,10 @@ class Span:
             content=data["content"],
             start_time=datetime.fromisoformat(data["start_time"]),
             end_time=datetime.fromisoformat(data["end_time"]) if data.get("end_time") else None,
-            attributes=data.get("attributes", {})
+            attributes=data.get("attributes", {}),
+            iteration=data.get("iteration", 0),
+            from_agent=data.get("from_agent"),
+            to_agent=data.get("to_agent")
         )
 
 
@@ -105,6 +124,48 @@ class Node:
     timestamp: datetime
     embedding: Optional[List[float]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class GEMMASNode:
+    """
+    GEMMAS-style node representing (Agent_ID, Iteration, Role).
+    
+    This aligns with the GEMMAS paper methodology where a node represents
+    an agent's specific interaction at a specific time step.
+    
+    Attributes:
+        agent_id: Unique identifier for the agent
+        iteration: Which iteration/turn this represents
+        role: 'prompt' (input processing) or 'response' (output generation)
+        span_id: Link to the original span for full details
+        content: Text content (may be truncated)
+        timestamp: When this interaction occurred
+    """
+    agent_id: str
+    iteration: int
+    role: str  # 'prompt' or 'response'
+    span_id: str
+    content: str
+    timestamp: datetime
+    
+    def node_key(self) -> str:
+        """Generate unique key for this node: (agent_id, iteration, role)."""
+        return f"{self.agent_id}_{self.iteration}_{self.role}"
+    
+    @classmethod
+    def from_span(cls, span: "Span", iteration: int = 0) -> "GEMMASNode":
+        """Create GEMMASNode from a Span."""
+        # Determine role based on step type
+        role = "response" if span.step_type in [StepType.OUTPUT, StepType.TOOL_RESULT] else "prompt"
+        return cls(
+            agent_id=span.agent_name,
+            iteration=iteration or span.iteration,
+            role=role,
+            span_id=span.span_id,
+            content=span.content[:500],  # Truncate for memory efficiency
+            timestamp=span.start_time
+        )
 
 
 @dataclass
@@ -157,17 +218,68 @@ class TraceData:
 
 
 @dataclass
+class ConfidenceBreakdown:
+    """
+    Detailed confidence scoring with component breakdown.
+    
+    Each component contributes to the final probability:
+    - evidence_strength (35%): How specific/quoted the evidence is
+    - pattern_match_score (25%): Match to MAST taxonomy indicators
+    - cross_reference_score (20%): References to specific spans/agents
+    - model_confidence (20%): LLM's self-reported confidence
+    """
+    evidence_strength: float = 0.5       # How specific the evidence is (0-1)
+    pattern_match_score: float = 0.5     # Match to taxonomy indicators (0-1)
+    cross_reference_score: float = 0.5   # References to spans/agents (0-1)
+    model_confidence: float = 0.5        # LLM's self-reported confidence (0-1)
+    
+    @property
+    def final_probability(self) -> float:
+        """Compute weighted final probability."""
+        weights = {
+            'evidence_strength': 0.35,
+            'pattern_match_score': 0.25,
+            'cross_reference_score': 0.20,
+            'model_confidence': 0.20
+        }
+        return round(
+            self.evidence_strength * weights['evidence_strength'] +
+            self.pattern_match_score * weights['pattern_match_score'] +
+            self.cross_reference_score * weights['cross_reference_score'] +
+            self.model_confidence * weights['model_confidence'],
+            3
+        )
+    
+    def to_percentage(self) -> str:
+        """Return probability as percentage string."""
+        return f"{self.final_probability * 100:.1f}%"
+    
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            'evidence_strength': self.evidence_strength,
+            'pattern_match_score': self.pattern_match_score,
+            'cross_reference_score': self.cross_reference_score,
+            'model_confidence': self.model_confidence,
+            'final_probability': self.final_probability
+        }
+
+
+@dataclass
 class FailureMode:
     """
-    Represents a detected MAST failure mode.
+    Represents a detected MAST failure mode with probabilistic confidence.
     
     Attributes:
         code: Failure mode code (e.g., "INTER-3")
         name: Human-readable name
         category: Category (specification, inter_agent, task_verification)
-        confidence: Confidence score (0-1)
+        confidence: Simple confidence score (0-1) for backward compatibility
         evidence: Supporting evidence from trace
         span_ids: IDs of spans involved in failure
+        confidence_breakdown: Detailed confidence scoring components
+        proof_quotes: Exact quotes from trace as proof
+        affected_steps: Step numbers affected (e.g., ["Step 1", "Step 3"])
+        reasoning_chain: Chain of reasoning that led to detection
     """
     code: str
     name: str
@@ -175,6 +287,21 @@ class FailureMode:
     confidence: float
     evidence: str
     span_ids: List[str] = field(default_factory=list)
+    # Enhanced confidence scoring
+    confidence_breakdown: Optional[ConfidenceBreakdown] = None
+    proof_quotes: List[str] = field(default_factory=list)
+    affected_steps: List[str] = field(default_factory=list)
+    reasoning_chain: str = ""
+    
+    def get_probability(self) -> float:
+        """Get the best available probability score."""
+        if self.confidence_breakdown:
+            return self.confidence_breakdown.final_probability
+        return self.confidence
+    
+    def get_probability_percentage(self) -> str:
+        """Get probability as formatted percentage."""
+        return f"{self.get_probability() * 100:.1f}%"
 
 
 @dataclass

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from mas_eval.core.base import BaseClassifier
-from mas_eval.core.types import Span, FailureMode
+from mas_eval.core.types import Span, FailureMode, ConfidenceBreakdown
 from mas_eval.mast.taxonomy import MASTTaxonomy, FailureCategory
 
 
@@ -97,8 +97,21 @@ class MASTClassifier(BaseClassifier):
         self.dataset_path = dataset_path
         self.taxonomy = MASTTaxonomy()
         self._client = None
+        self._is_tuned_model = model.startswith("tunedModels/")
         
-        # Load few-shot loader if needed
+        # Check for FINE_TUNED mode usage
+        if self.mode == ClassifierMode.FINE_TUNED:
+            if self._is_tuned_model:
+                print(f"✅ Using fine-tuned model: {model}")
+            else:
+                print("⚠️  FINE_TUNED mode selected but model is not a tuned model.")
+                print("   → To fine-tune, use MASTFineTuner:")
+                print("   from mas_eval.mast.fine_tuning import MASTFineTuner")
+                print("   tuner = MASTFineTuner()")
+                print('   model_id = tuner.train_on_mad_dataset("mast_dataset/MAD_human_labelled_dataset.json")')
+                print("   → Then use: MASTClassifier(model=model_id, mode=ClassifierMode.FINE_TUNED)")
+        
+        # Load few-shot loader only if NOT using a tuned model (tuned models don't need examples)
         self._fewshot_loader = None
         if self.mode == ClassifierMode.FEW_SHOT_ICL:
             from mas_eval.mast.mast_fewshot import MASTFewShotLoader
@@ -340,20 +353,28 @@ Respond with ONLY valid JSON in this exact format:
     "failures": [
         {{
             "code": "FAILURE-CODE",
-            "confidence": 0.85,
-            "evidence": "Exact quote or description from trace",
-            "reasoning": "Why this constitutes the failure mode",
-            "affected_agents": ["agent names involved"],
-            "span_references": ["Step 1", "Step 3"]
+            "confidence_breakdown": {{
+                "evidence_strength": 0.9,
+                "pattern_match_score": 0.85,
+                "cross_reference_score": 0.7,
+                "model_confidence": 0.88
+            }},
+            "proof_quotes": [
+                "Exact quoted text from trace that proves this failure"
+            ],
+            "affected_steps": ["Step 1", "Step 3"],
+            "reasoning_chain": "Step-by-step explanation: 1) First observation, 2) Second observation, 3) Conclusion",
+            "evidence": "Summary of evidence",
+            "affected_agents": ["agent names involved"]
         }}
     ],
     "summary": "Overall assessment of MAS execution quality"
 }}
 
 IMPORTANT:
-- Only report failures with confidence >= {self.confidence_threshold}
-- Provide specific evidence from the trace for each failure
-- If no failures are detected, return empty failures array
+- Only report failures with final probability >= {self.confidence_threshold}
+- Provide EXACT QUOTED TEXT from the trace in proof_quotes
+- Reference specific step numbers in affected_steps
 - Be thorough but avoid false positives"""
     
     def _fine_tuned_prompt(self, trace_text: str) -> str:
@@ -506,39 +527,78 @@ Respond with valid JSON only."""
         failure_modes = []
         for f in data.get("failures", []):
             mode_def = self.taxonomy.get_mode(f.get("code", ""))
-            if mode_def and f.get("confidence", 0) >= self.confidence_threshold:
-                # Extract span references if provided by fine-tuned prompt
-                span_refs = f.get("span_references", [])
-                affected_span_ids = []
-                
-                # Try to match span references to actual spans
-                for ref in span_refs:
-                    step_match = re.search(r'Step\s+(\d+)', str(ref), re.IGNORECASE)
-                    if step_match:
-                        idx = int(step_match.group(1)) - 1
-                        if 0 <= idx < len(spans):
-                            affected_span_ids.append(spans[idx].span_id)
-                
-                # Fall back to first few spans if no matches
-                if not affected_span_ids:
-                    affected_span_ids = [s.span_id for s in spans[:3]]
-                
-                # Build enhanced evidence with reasoning if available
+            if not mode_def:
+                continue
+            
+            # Parse confidence breakdown if available
+            conf_breakdown_data = f.get("confidence_breakdown", {})
+            if conf_breakdown_data:
+                conf_breakdown = ConfidenceBreakdown(
+                    evidence_strength=conf_breakdown_data.get("evidence_strength", 0.5),
+                    pattern_match_score=conf_breakdown_data.get("pattern_match_score", 0.5),
+                    cross_reference_score=conf_breakdown_data.get("cross_reference_score", 0.5),
+                    model_confidence=conf_breakdown_data.get("model_confidence", 0.5)
+                )
+                final_prob = conf_breakdown.final_probability
+            else:
+                # Fallback: use raw confidence and create breakdown from calibration
+                raw_conf = f.get("confidence", 0.5)
                 evidence = f.get("evidence", "")
-                reasoning = f.get("reasoning", "")
-                if reasoning and reasoning not in evidence:
-                    evidence = f"{evidence}\nReasoning: {reasoning}"
-                
-                failure_modes.append(FailureMode(
-                    code=f["code"],
-                    name=mode_def.name,
-                    category=mode_def.category.value,
-                    confidence=self._calibrate_confidence(f.get("confidence", 0.5), evidence),
-                    evidence=evidence,
-                    span_ids=affected_span_ids
-                ))
+                calibrated = self._calibrate_confidence(raw_conf, evidence)
+                conf_breakdown = ConfidenceBreakdown(
+                    evidence_strength=calibrated,
+                    pattern_match_score=raw_conf,
+                    cross_reference_score=raw_conf * 0.8,
+                    model_confidence=raw_conf
+                )
+                final_prob = conf_breakdown.final_probability
+            
+            # Filter by threshold
+            if final_prob < self.confidence_threshold:
+                continue
+            
+            # Extract step references
+            affected_steps = f.get("affected_steps", []) or f.get("span_references", [])
+            affected_span_ids = []
+            
+            for ref in affected_steps:
+                step_match = re.search(r'Step\s+(\d+)', str(ref), re.IGNORECASE)
+                if step_match:
+                    idx = int(step_match.group(1)) - 1
+                    if 0 <= idx < len(spans):
+                        affected_span_ids.append(spans[idx].span_id)
+            
+            # Fall back to first few spans if no matches
+            if not affected_span_ids:
+                affected_span_ids = [s.span_id for s in spans[:3]]
+            
+            # Extract proof quotes
+            proof_quotes = f.get("proof_quotes", [])
+            if not proof_quotes and f.get("evidence"):
+                # Create proof quote from evidence
+                proof_quotes = [f.get("evidence", "")[:200]]
+            
+            # Build evidence summary
+            evidence = f.get("evidence", "")
+            reasoning = f.get("reasoning_chain", "") or f.get("reasoning", "")
+            if reasoning and reasoning not in evidence:
+                evidence = f"{evidence}\nReasoning: {reasoning}"
+            
+            failure_modes.append(FailureMode(
+                code=f["code"],
+                name=mode_def.name,
+                category=mode_def.category.value,
+                confidence=final_prob,  # Use computed probability
+                evidence=evidence,
+                span_ids=affected_span_ids,
+                # New enhanced fields
+                confidence_breakdown=conf_breakdown,
+                proof_quotes=proof_quotes,
+                affected_steps=affected_steps,
+                reasoning_chain=reasoning
+            ))
         
-        # Extract analysis if available (from fine-tuned prompt)
+        # Extract analysis if available
         analysis = data.get("analysis", {})
         summary = data.get("summary", "")
         if analysis and not summary:
@@ -618,9 +678,34 @@ Respond with valid JSON only."""
             lines.append("Detected Failures:")
             for f in result.failure_modes:
                 lines.append(f"  [{f.code}] {f.name}")
-                lines.append(f"    Confidence: {f.confidence:.2%}")
+                
+                # Show probability with breakdown if available
+                if f.confidence_breakdown:
+                    prob = f.confidence_breakdown.final_probability
+                    lines.append(f"    🎯 Probability: {prob * 100:.1f}%")
+                    lines.append(f"       └─ Evidence Strength:    {f.confidence_breakdown.evidence_strength:.0%}")
+                    lines.append(f"       └─ Pattern Match:        {f.confidence_breakdown.pattern_match_score:.0%}")
+                    lines.append(f"       └─ Cross-Reference:      {f.confidence_breakdown.cross_reference_score:.0%}")
+                    lines.append(f"       └─ Model Confidence:     {f.confidence_breakdown.model_confidence:.0%}")
+                else:
+                    lines.append(f"    Confidence: {f.confidence:.0%}")
+                
                 lines.append(f"    Category: {f.category}")
-                lines.append(f"    Evidence: {f.evidence[:100]}...")
+                
+                # Show proof quotes if available
+                if f.proof_quotes:
+                    lines.append("    📝 Proof Quotes:")
+                    for quote in f.proof_quotes[:2]:
+                        lines.append(f"       \"{quote[:100]}...\"")
+                
+                # Show affected steps if available
+                if f.affected_steps:
+                    lines.append(f"    📍 Affected Steps: {', '.join(f.affected_steps[:5])}")
+                
+                # Show reasoning chain if available
+                if f.reasoning_chain:
+                    lines.append(f"    💭 Reasoning: {f.reasoning_chain[:150]}...")
+                
                 lines.append("")
         else:
             lines.append("✅ No failure modes detected above threshold")
@@ -629,3 +714,4 @@ Respond with valid JSON only."""
         lines.append(f"Summary: {result.trace_summary}")
         
         return "\n".join(lines)
+

@@ -275,3 +275,87 @@ class GraphVisualizer:
         
         net.save_graph(output_path)
         print(f"📊 Interactive graph saved to {output_path}")
+    
+    def plot_adjacency_matrices(
+        self,
+        S: any,
+        T: any,
+        agents: list,
+        output_path: str = None,
+        figsize: tuple = (14, 6)
+    ) -> None:
+        """
+        Visualize GEMMAS Spatial (S) and Temporal (T) adjacency matrices as heatmaps.
+        
+        Args:
+            S: Spatial matrix (who talks to whom)
+            T: Temporal matrix (causal ordering)
+            agents: List of agent names (rows/columns)
+            output_path: Optional path to save figure
+            figsize: Figure size
+        """
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("matplotlib not installed. Run: pip install matplotlib")
+            return
+        
+        if S is None or T is None:
+            print("⚠️ Adjacency matrices not available")
+            return
+        
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+        
+        # Spatial Matrix heatmap
+        im1 = axes[0].imshow(S, cmap='Blues', aspect='auto')
+        axes[0].set_xticks(range(len(agents)))
+        axes[0].set_yticks(range(len(agents)))
+        axes[0].set_xticklabels(agents, rotation=45, ha='right', fontsize=9)
+        axes[0].set_yticklabels(agents, fontsize=9)
+        axes[0].set_title('Spatial Matrix (S)\nWho Talks to Whom', fontweight='bold')
+        axes[0].set_xlabel('To Agent')
+        axes[0].set_ylabel('From Agent')
+        
+        # Add value annotations
+        for i in range(len(agents)):
+            for j in range(len(agents)):
+                val = S[i, j]
+                if val > 0:
+                    axes[0].text(j, i, f'{val:.0f}', ha='center', va='center',
+                                color='white' if val > S.max()/2 else 'black', fontsize=10)
+        
+        plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+        
+        # Temporal Matrix heatmap
+        im2 = axes[1].imshow(T, cmap='Greens', aspect='auto')
+        axes[1].set_xticks(range(len(agents)))
+        axes[1].set_yticks(range(len(agents)))
+        axes[1].set_xticklabels(agents, rotation=45, ha='right', fontsize=9)
+        axes[1].set_yticklabels(agents, fontsize=9)
+        axes[1].set_title('Temporal Matrix (T)\nCausal Ordering', fontweight='bold')
+        axes[1].set_xlabel('Succeeding Agent')
+        axes[1].set_ylabel('Preceding Agent')
+        
+        # Add value annotations
+        for i in range(len(agents)):
+            for j in range(len(agents)):
+                val = T[i, j]
+                if val > 0:
+                    axes[1].text(j, i, f'{val:.0f}', ha='center', va='center',
+                                color='white' if val > T.max()/2 else 'black', fontsize=10)
+        
+        plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+        
+        plt.tight_layout()
+        
+        if output_path:
+            plt.savefig(output_path, dpi=150, bbox_inches='tight')
+            print(f"📊 Adjacency matrices saved to {output_path}")
+        
+        plt.show()
+        
+        # Print summary
+        print(f"\n📊 GEMMAS Adjacency Matrices Summary:")
+        print(f"   Agents: {agents}")
+        print(f"   S matrix sum: {S.sum():.0f} (total cross-agent communications)")
+        print(f"   T matrix sum: {T.sum():.0f} (total causal orderings)")
