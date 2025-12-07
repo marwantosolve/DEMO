@@ -245,6 +245,19 @@ class GEMMAS_Evaluator:
         
         return results
     
+    def compute(self, graph: nx.DiGraph, spans: List[Span] = None) -> Dict[str, Any]:
+        """
+        Alias for evaluate() for backward compatibility.
+        
+        Args:
+            graph: Causal Reasoning Graph
+            spans: Optional list of spans
+            
+        Returns:
+            Dictionary with all metrics and interpretations
+        """
+        return self.evaluate(graph, spans)
+    
     def _calculate_overall(self, ids: float, upr: float) -> str:
         """Calculate overall quality assessment."""
         if ids > 0.6 and upr < 0.3:
@@ -288,3 +301,7 @@ class GEMMAS_Evaluator:
             "upr_threshold": self.upr_metric.efficiency_threshold,
             "custom_metrics": list(self._custom_metrics.keys())
         }
+
+
+# Backward compatibility alias
+GEMMASMetrics = GEMMAS_Evaluator

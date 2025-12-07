@@ -264,14 +264,17 @@ class MASAdvisor:
         "TRS": {"excellent": 0.7, "good": 0.5, "poor": 0.3}
     }
     
-    def __init__(self, include_low_priority: bool = True):
+    def __init__(self, include_low_priority: bool = True, model: str = None):
         """
         Initialize the MAS Advisor.
         
         Args:
             include_low_priority: Whether to include low priority suggestions
+            model: Optional model parameter (kept for API compatibility, not used)
         """
         self.include_low_priority = include_low_priority
+        # model parameter is accepted for backward compatibility but not used
+        # (advisor uses rule-based logic, not LLM)
     
     def generate_suggestions(
         self,
@@ -316,6 +319,39 @@ class MASAdvisor:
         suggestions = self._deduplicate(suggestions)
         
         return suggestions
+    
+    def generate_suggestions_from_data(
+        self,
+        spans: List = None,
+        failures: List[FailureMode] = None,
+        metrics: Dict[str, float] = None,
+        graph_stats: Dict[str, Any] = None,
+        task_description: str = ""
+    ) -> List[Suggestion]:
+        """
+        Alternative API accepting raw data instead of EvaluationResult.
+        
+        This method provides backward compatibility for code that passes
+        individual arguments rather than an EvaluationResult object.
+        
+        Args:
+            spans: List of spans (not directly used, kept for API compat)
+            failures: List of detected failure modes
+            metrics: Dictionary of metric values (IDS, UPR, etc.)
+            graph_stats: Graph statistics
+            task_description: Description of the task (not used)
+            
+        Returns:
+            List of prioritized Suggestion objects
+        """
+        # Create a minimal EvaluationResult from components
+        result = EvaluationResult(
+            trace_id="from_data",
+            metrics=metrics or {},
+            failures=failures or [],
+            graph_stats=graph_stats or {}
+        )
+        return self.generate_suggestions(result)
     
     def _failure_based_suggestions(
         self,
